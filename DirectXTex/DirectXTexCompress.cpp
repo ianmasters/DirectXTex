@@ -16,12 +16,25 @@
 #pragma warning(disable : 4616 6993)
 #endif
 
+#include <execution>
+
 #include "BC.h"
 
 using namespace DirectX;
 
 namespace
 {
+    template<class Index, class Callable>
+    void parallel_for_unseq(Index start, Index end, Callable func)
+    {
+        const char* const p0 = (char*)(ULONG_PTR)start;
+        const char* const p1 = (char*)(ULONG_PTR)end;
+        std::for_each(std::execution::par_unseq, p0, p1, [&](const char& p) {
+            Index i = static_cast<Index>(&p - p0);
+            func(i);
+            });
+    }
+
     inline DWORD GetBCFlags(_In_ DWORD compress) noexcept
     {
         static_assert(static_cast<int>(TEX_COMPRESS_RGB_DITHER) == static_cast<int>(BC_FLAGS_DITHER_RGB), "TEX_COMPRESS_* flags should match BC_FLAGS_*");
@@ -399,8 +412,7 @@ namespace
         // Round to bytes
         dbpp = (dbpp + 7) / 8;
 
-        uint8_t *pDest = result.pixels;
-        if (!pDest)
+        if (!result.pixels)
             return E_POINTER;
 
         // Promote "typeless" BC formats
@@ -440,53 +452,60 @@ namespace
             return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         }
 
-        __declspec(align(16)) XMVECTOR temp[16];
-        const uint8_t *pSrc = cImage.pixels;
         const size_t rowPitch = result.rowPitch;
-        for (size_t h = 0; h < cImage.height; h += 4)
-        {
-            const uint8_t *sptr = pSrc;
-            uint8_t* dptr = pDest;
-            size_t ph = std::min<size_t>(4, cImage.height - h);
-            size_t w = 0;
-            for (size_t count = 0; (count < cImage.rowPitch) && (w < cImage.width); count += sbpp, w += 4)
-            {
-                pfDecode(temp, sptr);
-                _ConvertScanline(temp, 16, format, cformat, 0);
+        bool error = false;
+        parallel_for_unseq((size_t)0, cImage.height / 4, [&](size_t y) {
+            if(!error) {
+                size_t h = y * 4;
 
-                size_t pw = std::min<size_t>(4, cImage.width - w);
-                assert(pw > 0 && ph > 0);
+                __declspec(align(16)) XMVECTOR temp[16];
+                const uint8_t* pSrc = cImage.pixels + y * cImage.rowPitch;
+                uint8_t* dptr = result.pixels + y * rowPitch * 4;
 
-                if (!_StoreScanline(dptr, rowPitch, format, &temp[0], pw))
-                    return E_FAIL;
+                const uint8_t* sptr = pSrc;
 
-                if (ph > 1)
-                {
-                    if (!_StoreScanline(dptr + rowPitch, rowPitch, format, &temp[4], pw))
-                        return E_FAIL;
+                size_t ph = std::min<size_t>(4, cImage.height - h);
+                size_t w = 0;
+                for(size_t count = 0; !error && (count < cImage.rowPitch) && (w < cImage.width); count += sbpp, w += 4) {
+                    pfDecode(temp, sptr);
+                    _ConvertScanline(temp, 16, format, cformat, 0);
 
-                    if (ph > 2)
-                    {
-                        if (!_StoreScanline(dptr + rowPitch * 2, rowPitch, format, &temp[8], pw))
-                            return E_FAIL;
+                    size_t pw = std::min<size_t>(4, cImage.width - w);
+                    assert(pw > 0 && ph > 0);
 
-                        if (ph > 3)
-                        {
-                            if (!_StoreScanline(dptr + rowPitch * 3, rowPitch, format, &temp[12], pw))
-                                return E_FAIL;
+                    if(!_StoreScanline(dptr, rowPitch, format, &temp[0], pw)) {
+                        error = true;
+                        break;
+                    }
+
+                    if(ph > 1) {
+                        if(!_StoreScanline(dptr + rowPitch, rowPitch, format, &temp[4], pw)) {
+                            error = true;
+                            break;
+                        }
+
+                        if(ph > 2) {
+                            if(!_StoreScanline(dptr + rowPitch * 2, rowPitch, format, &temp[8], pw)) {
+                                error = true;
+                                break;
+                            }
+
+                            if(ph > 3) {
+                                if(!_StoreScanline(dptr + rowPitch * 3, rowPitch, format, &temp[12], pw)) {
+                                    error = true;
+                                    break;
+                                }
+                            }
                         }
                     }
+
+                    sptr += sbpp;
+                    dptr += dbpp * 4;
                 }
-
-                sptr += sbpp;
-                dptr += dbpp * 4;
             }
+        });
 
-            pSrc += cImage.rowPitch;
-            pDest += rowPitch * 4;
-        }
-
-        return S_OK;
+        return error ? E_FAIL : S_OK;
     }
 }
 
